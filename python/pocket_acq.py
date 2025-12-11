@@ -329,7 +329,7 @@ if __name__ == '__main__':
     
     try:
         # read IF data
-        data = sdr_func.read_data(file, fs, IQ, T + Tcode, toff)
+        data = sdr_func.read_data(file, fs, IQ, T + Tcode, toff, sdrname=sdrn)
         
         if not opt[3]:
             fig = plt.figure(window, figsize=size)

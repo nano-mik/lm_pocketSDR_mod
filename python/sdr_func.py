@@ -68,13 +68,26 @@ log_str = None     # log stream
 #  returns:
 #      data     Digitized IF data as complex64 ndarray (length == 0: read error)
 #
-def read_data(file, fs, IQ, T, toff=0.0):
+def read_data(file, fs, IQ, T, toff=0.0, sdrname = 'pocketsdr'):
     off = int(fs * toff * IQ)
     cnt = int(fs * T * IQ) if T > 0.0 else -1 # all if T=0.0
     
+    if sdrname == 'pocketsdr':
+        dt    = 'int8'
+        div   =  1
+        qsgn = -1
+    elif sdrname == 'bladerf':
+        dt    = 'int16'
+        div   = 256
+        qsgn = 1
+    else:
+           raise ValueError('Please specify appropriate SDR.')
+
+
+
     f = open(file, 'rb')
     f.seek(off, os.SEEK_SET)
-    raw = np.fromfile(f, dtype=np.int8, count=cnt)
+    raw = np.fromfile(f, dtype=dt, count=cnt)
     f.close()
     
     if len(raw) < cnt:
@@ -82,7 +95,7 @@ def read_data(file, fs, IQ, T, toff=0.0):
     elif IQ == 1: # I-sampling
         return np.array(raw, dtype='complex64')
     else: # IQ-sampling
-        return np.array(raw[0::2] - raw[1::2] * 1j, dtype='complex64')
+        return np.array(raw[0::2]/div - raw[1::2] * 1j*qsgn/div, dtype='complex64')
 
 #-------------------------------------------------------------------------------
 #  Parallel code search in digitized IF data.

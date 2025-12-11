@@ -30,7 +30,19 @@ ESC_RES = '\033[0m'  # ANSI escape reset
 ESC_UCUR = '\033[A'  # ANSI escape cursor up
 
 # read IF data -----------------------------------------------------------------
-def read_data(fp, N, IQ, buff, ix):
+def read_data(fp, N, IQ, buff, ix, sdrname = 'pocketsdr'):
+
+    if sdrname == 'pocketsdr':
+        dt    = 'int8'
+        div   =  1
+        qsgn = -1
+    elif sdrname == 'bladerf':
+        dt    = 'int16'
+        div   = 256
+        qsgn = 1
+    else:
+           raise ValueError('Please specify appropriate SDR.')
+
     if fp == None:
         raw = np.frombuffer(sys.stdin.buffer.read(N * IQ), dtype='int8')
     else:
@@ -230,6 +242,9 @@ if __name__ == '__main__':
         elif sys.argv[i] == '-log':
             i += 1
             log_file = sys.argv[i]
+        elif sys.argv[i] == '-sdr':
+            i += 1
+            sdrn = sys.argv[i]
         elif sys.argv[i] == '-q':
             quiet = 1
         elif sys.argv[i][0] == '-':
@@ -279,7 +294,7 @@ if __name__ == '__main__':
             time_rcv = toff + T * (i - 1) # receiver time
             
             # read IF data to buffer
-            if not read_data(fp, N, IQ, buff, N * (i % MAX_BUFF)):
+            if not read_data(fp, N, IQ, buff, N * (i % MAX_BUFF), sdrname=sdr):
                 break;
             
             if i == 0:

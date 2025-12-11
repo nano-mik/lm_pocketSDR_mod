@@ -156,6 +156,9 @@ if __name__ == '__main__':
             IQ = 2
         elif sys.argv[i] == '-h':
             hist = 1
+        elif sys.argv[i] == '-sdr':
+            i += 1
+            sdrn = sys.argv[i]
         elif sys.argv[i][0] == '-':
             show_usage()
         else:
@@ -180,7 +183,7 @@ if __name__ == '__main__':
     
     try:
         for i in range(0, 10000000):
-            data = sdr_func.read_data(file, fs, IQ, tint, toff=tint * i)
+            data = sdr_func.read_data(file, fs, IQ, tint, toff=tint * i, sdrname=sdrn)
             
             if plt.figure(window) != fig: # window closed
                 exit()

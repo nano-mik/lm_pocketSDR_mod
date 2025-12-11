@@ -797,6 +797,9 @@ if __name__ == '__main__':
             opts[2] = 1
         elif sys.argv[i] == '-legend':
             opts[3] = 1
+        elif sys.argv[i] == '-sdr':
+            i += 1
+            sdrn = sys.argv[i]
         elif sys.argv[i] == '-opt':
             i += 1
             opts[4] += ' ' + sys.argv[i]

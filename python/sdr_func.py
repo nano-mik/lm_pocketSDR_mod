@@ -46,7 +46,7 @@ else:
 
 # constants --------------------------------------------------------------------
 DOP_STEP = 0.5     # Doppler frequency search step (* 1 / code cycle)
-LIBSDR_ENA = True  # enable flag of LIBSDR
+LIBSDR_ENA = False  # enable flag of LIBSDR
 
 # global variable --------------------------------------------------------------
 carr_tbl = []      # carrier lookup table 
@@ -68,21 +68,40 @@ log_str = None     # log stream
 #  returns:
 #      data     Digitized IF data as complex64 ndarray (length == 0: read error)
 #
+#def read_data(file, fs, IQ, T, toff=0.0):
+#    off = int(fs * toff * IQ)
+#    cnt = int(fs * T * IQ) if T > 0.0 else -1 # all if T=0.0
+#    
+#    f = open(file, 'rb')
+#    f.seek(off, os.SEEK_SET)
+#    raw = np.fromfile(f, dtype=np.int8, count=cnt)
+#    f.close()
+#    
+#    if len(raw) < cnt:
+#        return np.array([], dtype='complex64')
+#    elif IQ == 1: # I-sampling
+#        return np.array(raw, dtype='complex64')
+#    else: # IQ-sampling
+#        return np.array(raw[0::2] - raw[1::2] * 1j, dtype='complex64')
+        
 def read_data(file, fs, IQ, T, toff=0.0):
-    off = int(fs * toff * IQ)
-    cnt = int(fs * T * IQ) if T > 0.0 else -1 # all if T=0.0
+    off = int(ceil(fs) * toff * IQ * 4)
+    cnt = ceil(fs * T * IQ) if T > 0.0 else -1 # all if T=0.0
     
     f = open(file, 'rb')
     f.seek(off, os.SEEK_SET)
-    raw = np.fromfile(f, dtype=np.int8, count=cnt)
+    raw = np.fromfile(f, dtype="complex64", count=cnt)
     f.close()
-    
+
     if len(raw) < cnt:
         return np.array([], dtype='complex64')
     elif IQ == 1: # I-sampling
         return np.array(raw, dtype='complex64')
-    else: # IQ-sampling
-        return np.array(raw[0::2] - raw[1::2] * 1j, dtype='complex64')
+    else: # IQ-sampling        
+        x = raw[0:len(raw)-1]
+        # print(x)
+        # return np.array(x[0::2] - (x[1::2] * 1j), dtype='complex64')
+        return np.array(x, dtype='complex64')
 
 #-------------------------------------------------------------------------------
 #  Parallel code search in digitized IF data.

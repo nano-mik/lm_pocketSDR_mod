@@ -353,6 +353,9 @@ if __name__ == '__main__':
         elif sys.argv[i] == '-out':
             i += 1
             ofile = sys.argv[i]
+        elif sys.argv[i] == '-sdr':
+            i += 1
+            sdrn = sys.argv[i]
         elif sys.argv[i] == '-v':
             VERP = 1
         elif sys.argv[i][0] == '-':
@@ -385,7 +388,7 @@ if __name__ == '__main__':
         
         # read DIF data
         IQ = 1 if fi > 0 else 2
-        dif = sdr_func.read_data(file, fs, IQ, tint, toff + ti * i)
+        dif = sdr_func.read_data(file, fs, IQ, tint, toff + ti * i, sdrname=sdrn)
         if len(dif) == 0:
             break
         

@@ -25,7 +25,7 @@ def show_usage():
 
 # plot PSD ---------------------------------------------------------------------
 def plot_psd(fig, rect, IQ, fs, fc, bc):
-    yl = [-80, -45]
+    yl = [-120, -45]
     if IQ == 1: # I
         xl = [0, fs * 0.5]
     else: # IQ
@@ -137,6 +137,7 @@ if __name__ == '__main__':
     file = ''
     fc = 'darkblue'
     bc = 'w'
+    sdrn='pocketsdr'
     rect0 = [0.08, 0.09, 0.84, 0.85]
     rect1 = [0.08, 0.09, 0.56, 0.85]
     rect2 = [0.67, 0.09, 0.30, 0.85]
@@ -156,8 +157,11 @@ if __name__ == '__main__':
             IQ = 2
         elif sys.argv[i] == '-h':
             hist = 1
-        elif sys.argv[i][0] == '-':
-            show_usage()
+        elif sys.argv[i] == '-sdr':
+            i += 1
+            sdrn = sys.argv[i]
+        #elif sys.argv[i][0] == '-':
+        #    show_usage()
         else:
             file = sys.argv[i];
         i += 1
@@ -180,7 +184,7 @@ if __name__ == '__main__':
     
     try:
         for i in range(0, 10000000):
-            data = sdr_func.read_data(file, fs, IQ, tint, toff=tint * i)
+            data = sdr_func.read_data(file, fs, IQ, tint, toff=tint * i, sdrname=sdrn)
             
             if plt.figure(window) != fig: # window closed
                 exit()

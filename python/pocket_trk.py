@@ -202,6 +202,7 @@ if __name__ == '__main__':
     ch = {}
     file, log_file, log_lvl, quiet = '', '', 4, 0
     fig = None
+    sdrn ='pocketsdr'
     
     i = 1
     while i < len(sys.argv):
@@ -247,8 +248,8 @@ if __name__ == '__main__':
             sdrn = sys.argv[i]
         elif sys.argv[i] == '-q':
             quiet = 1
-        elif sys.argv[i][0] == '-':
-            show_usage()
+        #elif sys.argv[i][0] == '-':
+        #    show_usage()
         else:
             file = sys.argv[i];
         i += 1

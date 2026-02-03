@@ -45,7 +45,8 @@ else:
     libsdr.sdr_func_init(''.encode())
 
 # constants --------------------------------------------------------------------
-DOP_STEP = 0.5     # Doppler frequency search step (* 1 / code cycle)
+#DOP_STEP = 0.5     # Doppler frequency search step (* 1 / code cycle)
+DOP_STEP = 0.25     # Doppler frequency search step (* 1 / code cycle)
 LIBSDR_ENA = False  # enable flag of LIBSDR
 
 # global variable --------------------------------------------------------------
@@ -85,26 +86,34 @@ log_str = None     # log stream
 #        return np.array(raw[0::2] - raw[1::2] * 1j, dtype='complex64')
         
 def read_data(file, fs, IQ, T, toff=0.0, sdrname = 'pocketsdr'):
-    off = int(ceil(fs) * toff * IQ * 4)
-    cnt = ceil(fs * T * IQ) if T > 0.0 else -1 # all if T=0.0
-    
+    #print("Read T: ", T)
+
     if sdrname == 'pocketsdr':
         dt    = 'int8'
         div   =  1
         qsgn = -1
+        doff = 4
     elif sdrname == 'bladerf':
         dt    = 'int16'
         div   = 256
         qsgn = 1
+        doff = 4
     elif sdrname == 'gnuradio':
-    	dt    = 'complex64'
+        dt    = 'complex64'
+        IQ = 1
+        doff = 8
     else:
-           raise ValueError('Please specify appropriate SDR.')
+        raise ValueError('Please specify appropriate SDR.')
+
+    off = int(ceil(fs) * toff * IQ * doff)
+    cnt = ceil(fs * T * IQ) if T > 0.0 else -1 # all if T=0.0
 
     f = open(file, 'rb')
     f.seek(off, os.SEEK_SET)
     raw = np.fromfile(f, dtype=dt, count=cnt)
     f.close()
+
+    #print("cnt: ", cnt, "iq: ", IQ)
 
     if len(raw) < cnt:
         return np.array([], dtype='complex64')
@@ -112,10 +121,10 @@ def read_data(file, fs, IQ, T, toff=0.0, sdrname = 'pocketsdr'):
         return np.array(raw, dtype='complex64')
     else: # IQ-sampling
         if dt == 'complex64':
-        	x = raw[0:len(raw)-1]
-        	return np.array(x, dtype='complex64')
+            x = raw[0:len(raw)-1]
+            return np.array(x, dtype='complex64')
         else:
-        	return np.array(raw[0::2]/div - raw[1::2] * 1j*qsgn/div, dtype='complex64')
+            return np.array((raw[0::2] - raw[1::2] * 1j * qsgn)/div, dtype='complex64')
 
 #-------------------------------------------------------------------------------
 #  Parallel code search in digitized IF data.

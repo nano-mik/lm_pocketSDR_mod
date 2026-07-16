@@ -1,0 +1,612 @@
+#!/usr/bin/env python3
+#
+#  Pocket SDR Python AP - GNSS Signal Acquisition
+#
+#  Author:
+#  T.TAKASU
+#
+#  History:
+#  2021-12-01  1.0  new
+#  2021-12-05  1.1  add signals: G1CA, G2CA, B1I, B2I, B1CD, B1CP, B2AD, B2AP,
+#                   B2BI, B3I
+#  2021-12-15  1.2  add option: -d, -nz, -np
+#  2022-01-20  1.3  add signals: I5S
+#                   add option: -l, -s
+#  2022-02-17  1.4  add option: -h
+#  2024-12-19  1.5  add option: -IQ
+#
+import sys, time
+import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import sdr_func, sdr_code
+from math import *
+
+mpl.rcParams['toolbar'] = 'None';
+mpl.rcParams['font.size'] = 9
+
+# constants --------------------------------------------------------------------
+T_AQC = 0.010        # non-coherent integration time for acquisition (s)
+THRES_CN0 = 38.0     # threshold to lock (dB-Hz)
+ESC_COL = '\033[34m' # ANSI escape color = blue
+ESC_RES = '\033[0m'  # ANSI escape reset
+
+# show usage -------------------------------------------------------------------
+def show_usage():
+    print('Usage: pocket_acq.py [-sig sig] [-prn prn[,...]] [-tint tint]')
+    print('       [-toff toff] [-f freq] [-fi freq] [-IQ] [-d freq] [-nz] [-np]')
+    print('       [-s] [-p] [-l] [-3d] file')
+
+# show signal type IDs ---------------------------------------------------------
+def show_sigid():
+    print('Signal type IDs (sig):')
+    print('       L1CA   GPS, QZSS, SBAS L1C/A')
+    print('       L1CB   QZSS L1C/B')
+    print('       L1CD   GPS, QZSS L1C-D')
+    print('       L1CP   GPS, QZSS L1C-P')
+    print('       L1S    QZSS L1S')
+    print('       L2CM   GPS, QZSS L2C-M')
+    print('       L5I    GPS, QZSS, SBAS L5-I')
+    print('       L5Q    GPS, QZSS, SBAS L5-Q')
+    print('       L5SI   QZSS L5S-I (normal mode)')
+    print('       L5SQ   QZSS L5S-Q (normal mode)')
+    print('       L5SIV  QZSS L5S-I (verification mode)')
+    print('       L5SQV  QZSS L5S-Q (verification mode)')
+    print('       L6D    QZSS L6D')
+    print('       L6E    QZSS L6E')
+    print('       G1CA   GLONASS L1C/A')
+    print('       G2CA   GLONASS L2C/A')
+    print('       G3OCD  GLONASS L3OCd')
+    print('       G3OCP  GLONASS L3OCp')
+    print('       E1B    Galileo E1-B')
+    print('       E1C    Galileo E1-C')
+    print('       E5AI   Galileo E5a-I')
+    print('       E5AQ   Galileo E5a-Q')
+    print('       E5BI   Galileo E5b-I')
+    print('       E5BQ   Galileo E5b-Q')
+    print('       E6B    Galileo E6-B')
+    print('       E6C    Galileo E6-C')
+    print('       B1I    BDS B1I')
+    print('       B1CD   BDS B1C-D')
+    print('       B1CP   BDS B1C-P')
+    print('       B2I    BDS B2I')
+    print('       B2AD   BDS B2a-D')
+    print('       B2AP   BDS B2a-P')
+    print('       B2BI   BDS B2b-I')
+    print('       B3I    BDS B3I')
+    print('       I1SD   NavIC L1-SPS-D')
+    print('       I1SP   NavIC L1-SPS-P')
+    print('       I5S    NavIC L5-SPS')
+    print('       ISS    NavIC S-SPS')
+
+def search_code_noncoh(code_fft, T, buff, ix, fs, fi, fds, ms=1):
+    """
+    Non-coherent integration over `ms` successive 1-ms blocks.
+    - T: coherent time in seconds (use 0.001 for 1 ms)
+    - ix: sample index where this 10-ms window starts
+    - fs: sample rate (Hz)
+    - fi: IF (Hz)
+    - fds: iterable of Doppler bins (Hz)
+    """
+    N = int(fs * T)  # samples per 1 ms block
+    P = np.zeros((len(fds), N), dtype='float32')
+
+    for i, fd in enumerate(fds):
+        acc = np.zeros(N, dtype='float32')
+        for m in range(ms):
+            # advance the input pointer by 1 ms each loop
+            ix_m = ix + m * N
+            C = sdr_func.corr_fft(buff, ix_m, len(code_fft), fs, fi + fd, 0.0, code_fft)[:N]
+            acc += (np.abs(C) ** 2)#.astype('float32')  # non-coherent (power) sum
+        P[i] = acc / ms  # “take the mean” as you asked; or drop /ms to keep it as a sum
+    return P
+
+def noise_stats(P, guard_f=1, guard_tau=2):
+    f_idx, tau_idx = np.unravel_index(np.argmax(P), P.shape)
+    Pn = P.copy()
+    Pn[max(0, f_idx-guard_f):f_idx+guard_f+1,max(0, tau_idx-guard_tau):tau_idx+guard_tau+1] = np.nan
+    return np.nanmean(Pn), np.nanstd(Pn)
+
+def z_score(P):
+    mu_P, sigma_P = noise_stats(P, 2, 32)
+    ix = np.unravel_index(np.argmax(P), P.shape)
+    P_max = P[ix[0]][ix[1]]
+    
+    #Z = (P_max - mu_P) / sigma_P / T) if sigma_P > 0.0 else 0.0
+    Z = (P_max - mu_P) / sigma_P if sigma_P > 0.0 else 0.0
+    print("mu: ", mu_P, " - sigma: ", sigma_P)
+    return P_max, ix, Z
+
+# search signals ---------------------------------------------------------------
+def search_sig(sig, prn, data, fs, fi, max_dop, zero_pad):
+    # generate code
+    code = sdr_code.gen_code(sig, prn)
+    
+    if len(code) == 0:
+        return [], [0.0], [0.0], (0, 0), 0.0, 0.0
+    
+    # shift IF frequency for GLONASS FDMA
+    fi = sdr_func.shift_freq(sig, prn, fi)
+
+    # generate code FFT
+    T = sdr_code.code_cyc(sig)
+    N = int(fs * T)
+    code_fft = sdr_code.gen_code_fft(code, T, 0.0, fs, N, N if zero_pad else 0)
+
+    # doppler search bins
+    fds = sdr_func.dop_bins(T, 0.0, max_dop)
+    
+    # parallel code search and non-coherent integration
+    P = np.zeros((len(fds), N), dtype='float32')
+
+    P_list = []
+
+    for i in range(0, len(data) - len(code_fft) + 1, N):
+        P += sdr_func.search_code(code_fft, T, data, i, fs, fi, fds)
+    
+    # max correlation power and C/N0
+    #P_max, ix, cn0 = sdr_func.corr_max(P, T)
+    P_max, ix, z = z_score(P)
+    
+    coffs = np.arange(N, dtype='float32') / fs
+    dop = sdr_func.fine_dop(P.T[ix[1]], fds, ix[0])
+    print("P Max:", P[ix[0]][ix[1]])
+    return P, fds, coffs, ix, z, dop, P_max
+
+def check_kasami(sig, prn, data, fs, fi, max_dop, zero_pad, ix):
+    # generate code
+    code = sdr_code.gen_code(sig, prn)
+    if prn == 1: #Kasami1
+        print("Kasami1")
+        code = np.array([-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j], dtype="complex64")
+    elif prn == 3: #Kasami3
+        print("Kasami3")
+        code = np.array([1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j], dtype="complex64")
+    elif prn == 7: #Kasami7
+        print("Kasami7")
+        code = np.array([-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,-1+0j,1+0j,1+0j,1+0j,1+0j,-1+0j,-1+0j,-1+0j,1+0j,-1+0j,1+0j,-1+0j,-1+0j,-1+0j], dtype="complex64")
+    else:
+        code = sdr_code.gen_code(sig, prn)
+    
+    if len(code) == 0:
+        return []
+    
+    # shift IF frequency for GLONASS FDMA
+    fi = sdr_func.shift_freq(sig, prn, fi)
+    
+    #print("len(code):", len(code))
+
+    # generate code FFT
+    T = sdr_code.code_cyc(sig)
+    N = int(fs * T)
+    code_fft = sdr_code.gen_code_fft(code, T, 0.0, fs, N, N if zero_pad else 0)
+
+    # doppler search bins
+    fds = sdr_func.dop_bins(T, 0.0, max_dop)
+    
+    # parallel code search and non-coherent integration
+    P_kasami = np.zeros((len(fds), N), dtype='float32')
+
+    for i in range(0, len(data) - len(code_fft) + 1, N):
+        P_kasami += sdr_func.search_code(code_fft, T, data, i, fs, fi, fds)
+
+    mu_P, sigma_P = noise_stats(P_kasami, 2, 32)
+    
+    print("mu: ", mu_P, " - sigma: ", sigma_P, " - KasamiPow: ", (P_kasami[ix[0]][ix[1]] - mu_P) / sigma_P / T)
+
+    #Z = 10.0 * log10((P_kasami[ix[0]][ix[1]] - mu_P) / sigma_P / T) if sigma_P > 0.0 else 0.0
+    Z = (P_kasami[ix[0]][ix[1]] - mu_P) / sigma_P if sigma_P > 0.0 else 0.0
+
+    print("P Kasami:", P_kasami[ix[0]][ix[1]])
+    # return P / P_max, fds, coffs, ix, cn0, dop, P_max
+    return P_kasami, Z
+
+# plot C/N0 --------------------------------------------------------------------
+def plot_cn0(ax, cn0, prns, fc):
+    thres = THRES_CN0
+    x = np.arange(len(cn0))
+    y = cn0
+    ax.bar(x[y <  thres], y[y <  thres], color='gray', width=0.6)
+    ax.bar(x[y >= thres], y[y >= thres], color=fc    , width=0.6)
+    ax.grid(True, lw=0.4)
+    ax.set_xlim([x[0] - 0.5, x[-1] + 0.5])
+    plt.xticks(x, ['%d' % (prn) for prn in prns])
+    ax.set_ylim([0, 40])
+    ax.set_xlabel('PRN Number')
+    ax.set_ylabel('C/N0 (dB-Hz)')
+
+# plot correlation 3D ----------------------------------------------------------
+def plot_corr_3d(ax, P, dops, coffs, ix, fc):
+    x, y = np.meshgrid(coffs * 1e3, dops)
+    z = P / np.mean(P) * 0.015
+    #ax.plot_wireframe(x, y, z, rstride=1, cstride=0, color=fc, lw=0.3, alpha=0.8)
+    ax.plot_surface(x, y, z, rstride=1, cstride=1, cmap='Greys', vmax=2, lw=0.1, edgecolor='k')
+    #ax.plot_surface(x, y, z, rstride=1, cstride=1, cmap='Blues', vmax=2, lw=0.1, edgecolor='b')
+    ax.set_xlim([x[0][0], x[0][-1]])
+    ax.set_ylim([y[0][0], y[-1][0]])
+    ax.set_zlim(0, 0.6)
+    ax.set_xlabel('Code Offset (ms)')
+    ax.set_ylabel('Doppler Frequency (Hz)')
+    ax.set_zlabel('Correlation Power')
+    ax.set_box_aspect((1, 1, 0.6))
+    ax.xaxis.set_pane_color((1, 1, 1, 0))
+    ax.yaxis.set_pane_color((1, 1, 1, 0))
+    ax.xaxis._axinfo["grid"]['color'] =  (1, 1, 1, 0)
+    ax.yaxis._axinfo["grid"]['color'] =  (1, 1, 1, 0)
+    ax.zaxis._axinfo["grid"]['color'] =  (1, 1, 1, 0)
+    ax.view_init(20, -50)
+
+# plot correlation 3D ----------------------------------------------------------
+def plot_corr_3d_abs(ax, P, dops, coffs, ix, fc):
+    x, y = np.meshgrid(coffs * 1e3, dops)
+    z = P #/ np.mean(P) * 0.015
+    #ax.plot_wireframe(x, y, z, rstride=1, cstride=0, color=fc, lw=0.3, alpha=0.8)
+    ax.plot_surface(x, y, z, rstride=1, cstride=1, cmap='Greys', vmax=2, lw=0.1, edgecolor='k')
+    #ax.plot_surface(x, y, z, rstride=1, cstride=1, cmap='Blues', vmax=2, lw=0.1, edgecolor='b')
+    ax.set_xlim([x[0][0], x[0][-1]])
+    ax.set_ylim([y[0][0], y[-1][0]])
+    ax.set_zlim(0, np.max(P)*1.1)
+    ax.set_xlabel('Code Offset (ms)')
+    ax.set_ylabel('Doppler Frequency (Hz)')
+    ax.set_zlabel('Correlation Power')
+    ax.set_box_aspect((1, 1, 0.6))
+    ax.xaxis.set_pane_color((1, 1, 1, 0))
+    ax.yaxis.set_pane_color((1, 1, 1, 0))
+    ax.xaxis._axinfo["grid"]['color'] =  (1, 1, 1, 0)
+    ax.yaxis._axinfo["grid"]['color'] =  (1, 1, 1, 0)
+    ax.zaxis._axinfo["grid"]['color'] =  (1, 1, 1, 0)
+    ax.view_init(20, -50)
+
+# plot correlation power -------------------------------------------------------
+def plot_corr_pow(ax, P, f, fc):
+    x = np.arange(len(P)) / f
+    y = P
+    ax.plot(x, y, '-', color='grey', lw=0.5)
+    ax.plot(x, y, '.', color=fc, ms=3)
+    ax.grid(True, lw=0.4)
+    ax.set_xlim([x[0], x[-1]])
+    ax.set_ylim([0, 1])
+    ax.set_ylabel('Correlation Power')
+
+# plot correlation power -------------------------------------------------------
+def plot_corr_pow_abs(ax, P, f, fc):
+    x = np.arange(len(P)) / f
+    y = P
+    maxP= np.max(P)
+    minP= np.min(P)
+    margin = (maxP - minP) * 0.1
+    ax.plot(x, y, '-', color='grey', lw=0.5)
+    ax.plot(x, y, '.', color=fc, ms=3)
+    ax.grid(True, lw=0.4)
+    ax.set_xlim([x[0]-0.3, x[-1]+0.3])
+    ax.set_ylim([minP-margin, maxP+margin])
+    # ax.set_ylim(0, 0.0004)
+    # ax.set_ylim(0, 6e-6)
+    ax.set_ylabel('Correlation Power Abs')
+
+# plot correlation peak ---------------------------------------------------------
+def plot_corr_peak(ax, x, y, xl, fc):
+    ax.plot(x, y, '-', color='gray', lw=0.5)
+    ax.plot(x, y, '.', color=fc, ms=3)
+    ax.grid(True, lw=0.4)
+    ax.set_xlim(xl)
+    ax.set_ylim([0, 1])
+    ax.set_ylabel('Correlation Power')
+
+# plot correlation peak ---------------------------------------------------------
+def plot_corr_peak_abs(ax, x, y, xl, fc):
+    maxP= np.max(y)
+    minP= np.min(y)
+    margin = (maxP - minP) * 0.1
+    ax.plot(x, y, '-', color='gray', lw=0.5)
+    ax.plot(x, y, '.', color=fc, ms=3)
+    ax.grid(True, lw=0.4)
+    ax.set_xlim(xl)
+    ax.set_ylim([minP-margin, maxP+margin])
+    # ax.set_ylim(0, 0.0004)
+    # ax.set_ylim(0, 6e-6)
+    ax.set_ylabel('Correlation Power Abs')
+
+# add text annotation in plot --------------------------------------------------
+def add_text(ax, x, y, text, color='k'):
+    ax.text(x, y, text, ha='right', va='top', color=color,
+        transform=ax.transAxes)
+
+#-------------------------------------------------------------------------------
+#
+#   Synopsis
+# 
+#     pocket_aqc.py [-sig sig] [-prn prn[,...]] [-tint tint] [-toff toff]
+#         [-f freq] [-fi freq] [-IQ] [-d freq] [-nz] [-np] [-s] [-p] [-l] [-3d]
+#         file
+# 
+#   Description
+# 
+#     Search GNSS signals in digital IF data and plot signal search results.
+#     If single PRN number by -prn option, it plots correlation power and
+#     correlation shape of the specified GNSS signal. If multiple PRN numbers
+#     specified by -prn option, it plots C/N0 for each PRN.
+# 
+#   Options ([]: default)
+#  
+#     -sig sig
+#         GNSS signal type ID (L1CA, L2CM, ...). See below for details. [L1CA]
+# 
+#     -prn prn[,...]
+#         PRN numbers of the GNSS signal separated by ','. A PRN number can be a
+#         PRN number range like 1-32 with start and end PRN numbers. For GLONASS
+#         FDMA signals (G1CA, G2CA), the PRN number is treated as FCN (frequency
+#         channel number). [1]
+# 
+#     -tint tint
+#         Integration time in ms to search GNSS signals. [code cycle]
+# 
+#     -toff toff
+#         Time offset from the start of digital IF data in ms. [0.0]
+# 
+#     -f freq
+#         Sampling frequency of digital IF data in MHz. [12.0]
+#
+#     -fi freq
+#         IF frequency of digital IF data in MHz. The IF frequency is equal 0,
+#         the IF data is treated as IQ-sampling without -IQ option (zero-IF).
+#         [0.0]
+#
+#     -IQ
+#         IQ-sampling even if the IF frequency is not equal 0.
+#
+#     -d freq
+#         Max Doppler frequency to search the signal in Hz. [5000.0]
+#
+#     -nz
+#         Disalbe zero-padding for circular colleration to search the signal.
+#         [enabled]
+#
+#     -np
+#         Disable plot even with single PRN number. [enabled]
+#
+#     -s
+#         Short output mode. [long output]
+#
+#     -p
+#         Plot correlation powers with correlation peak graph.
+#
+#     -l
+#         Plot correlation powers along Doppler frequencies.
+#
+#     -3d
+#         Plot correlation powers in a 3D-plot.
+#
+#     -h
+#         Show usage and signal type IDs
+#
+#     file
+#         File path of the input digital IF data. The format should be a series of
+#         int8_t (signed byte) for real-sampling (I-sampling) or interleaved int8_t
+#         for complex-sampling (IQ-sampling). PocketSDR and AP pocket_dump can be
+#         used to capture such digital IF data.
+#
+#   GNSS signal type IDs
+#
+#
+if __name__ == '__main__':
+    window = 'PocketSDR - GNSS SIGNAL ACQUISITION'
+    size = (14, 6)
+    sig, prns = 'L1CA', [1]
+    fs, fi, IQ, T, toff = 16.368e6, 0, 1, T_AQC, 0.0005
+    max_dop = 25000.0
+    opt = [0, False, False, False, False]
+    fc, bc = 'darkblue', 'w'
+    rect0 = [0.08, 0.09, 0.84, 0.85]
+    rect1 = [0.08, 0.53, 0.41, 0.41] #[0.08, 0.53, 0.84, 0.41]
+    rect2 = [0.55, 0.53, 0.41, 0.41] # [0.08, 0.07, 0.41, 0.41] #[0.08, 0.07, 0.84, 0.41]
+    rect3 = [0, -0.05, 1, 1.25]
+    rectA = [0.08, 0.07, 0.41, 0.41] # [0.55, 0.53, 0.41, 0.41]
+    rectB = [0.55, 0.07, 0.41, 0.41]
+    file = ''
+    label = 'PRN'
+    bg, wm = False, False
+    sdrn = 'pocketsdr'
+    ms = 1
+    Pmax = 0
+    
+    i = 1
+    while i < len(sys.argv):
+        if sys.argv[i] == '-sig':
+            i += 1
+            sig = sys.argv[i]
+        elif sys.argv[i] == '-prn':
+            i += 1
+            prns = sdr_func.parse_nums(sys.argv[i])
+        elif sys.argv[i] == '-tint':
+            i += 1
+            T = float(sys.argv[i]) * 1e-3
+        elif sys.argv[i] == '-  ':
+            i += 1
+            toff = float(sys.argv[i]) * 1e-3
+        elif sys.argv[i] == '-f':
+            i += 1
+            fs = ceil(float(sys.argv[i]) * 1e6)
+        elif sys.argv[i] == '-fi':
+            i += 1
+            fi = float(sys.argv[i]) * 1e6
+            #IQ = 2 if fi == 0 else 1
+        elif sys.argv[i] == '-IQ':
+            IQ = 2;
+        elif sys.argv[i] == '-d':
+            i += 1
+            max_dop = float(sys.argv[i])
+        elif sys.argv[i] == '-p':
+            opt[0] = 1
+        elif sys.argv[i] == '-l':
+            opt[0] = 2
+        elif sys.argv[i] == '-3d':
+            opt[1] = True
+        elif sys.argv[i] == '-nz':
+            opt[2] = False
+        elif sys.argv[i] == '-np':
+            opt[3] = True
+        elif sys.argv[i] == '-s':
+            opt[4] = True
+        elif sys.argv[i] == '-bg':
+            bg = True
+        elif sys.argv[i] == '-wm':
+            wm = True
+        #elif sys.argv[i] == '-ms':
+            #i += 1
+            #ms = int(sys.argv[i])
+        elif sys.argv[i] == '-sdr':
+            i += 1
+            sdrn = sys.argv[i]
+        elif sys.argv[i] == '-h':
+            show_usage()
+            show_sigid()
+            exit()
+        # elif sys.argv[i][0] == '-':
+            # show_usage()
+            # exit()
+        else:
+            file = sys.argv[i];
+        i += 1
+    
+    if file == '':
+        # print('Specify input file.')
+        # exit()
+        file = 'C:\\Users\\mi_enano\\Downloads\\MultiPRN=1_Kasami=0.3.bin'
+        prns = sdr_func.parse_nums('33')
+        opt[0] = 2
+    
+    Tcode = sdr_code.code_cyc(sig) # code cycle (s)
+    if Tcode <= 0:
+        print('Invalid signal %s.' % (sig))
+        exit()
+
+    # integration time (s)
+    if T < Tcode or sig[:2] == 'L6':
+        T = Tcode
+    
+    if sig == 'G1CA' or sig == 'G2CA':
+        label = 'FCN'
+    
+    print("Sampling Freq:",fs, " |Carrier Freq:", fi)
+
+    try:
+        # read IF data
+        data = sdr_func.read_data(file, fs, IQ, T, toff, sdrname=sdrn)
+        #data = sdr_func.read_data(file, fs, IQ, 1*(T + Tcode), toff, sdrname=sdrn)
+        print(data)
+
+        if not opt[3]:
+            fig = plt.figure(window, figsize=size)
+            ax0 = fig.add_axes(rect0)
+            ax0.axis('off')
+        t = time.time()
+        
+        ms = T
+        
+        if len(prns) > 1:
+            cn0 = np.zeros(len(prns))
+            for i in range(len(prns)):
+                P, dops, coffs, ix, cn0[i], dop, Pmax = search_sig(sig, prns[i], data,
+                    fs, fi, max_dop=max_dop, zero_pad=opt[2], ms=ms) # opt[2] '-nz'
+                
+                if opt[4]: # short output mode '-s'
+                    print('%d %.0f' % (prns[i], cn0[i]))
+                else:
+                    print('%sSIG= %-4s, %s= %3d, COFF= %8.5f ms, DOP= %5.0f Hz, C/N0= %4.1f dB-Hz%s' % \
+                        (ESC_COL if cn0[i] >= THRES_CN0 else '',
+                         sig, label, prns[i], coffs[ix[1]] * 1e3, dop, cn0[i],
+                         ESC_RES if cn0[i] >= THRES_CN0 else ''))
+            
+            if not opt[3]: # opt[3] '-np'
+                ax1 = fig.add_axes(rect0, facecolor=bc)
+                plot_cn0(ax1, cn0, prns, fc)
+                if not bg:
+                    ax0.set_title('SIG = %s, Watermark = %s, FILE = %s' % (sig, wm, file), fontsize=10)
+                else: 
+                    ax0.set_title('Background Noise, FILE = %s' % (file), fontsize=10)
+        else:
+            P, dops, coffs, ix, cn0, dop, Pmax = search_sig(sig, prns[0], data, fs, fi,
+                max_dop=max_dop, zero_pad=opt[2]) # opt[2] '-nz'
+            text = 'COFF=%.5fms, DOP=%.0fHz, Z=%.1fdB-Hz' % \
+                   (coffs[ix[1]] * 1e3, dop, cn0)
+
+            if opt[3]: # text '-np' 
+                if opt[4]: # short output mode '-s'
+                    print('%d %.0f' % (prns[0], cn0))
+                else:
+                    print('%sSIG= %-4s, %s= %3d, COFF= %8.5f ms, DOP= %5.0f Hz, C/N0= %4.1f dB-Hz%s' % \
+                        (ESC_COL if cn0 >= THRES_CN0 else '',
+                         sig, label, prns[0], coffs[ix[1]] * 1e3, dop, cn0,
+                         ESC_RES if cn0 >= THRES_CN0 else ''))
+                exit()
+            elif opt[1]: # plot 3D '-3d'
+                ax1 = fig.add_axes(rect3, projection='3d', facecolor='None')
+                plot_corr_3d_abs(ax1, P, dops, coffs, ix, fc)
+                add_text(ax0, 0.98, 0.96, text, color=fc)
+            elif opt[0]: # plot power + peak/doppler 1:'-p' 2:'-l'
+                ax1 = fig.add_axes(rect1, facecolor=bc)
+                print("Dopp.Bin_ix[0]:", ix[0], "Code.Off_ix[1]:", ix[1])
+                plot_corr_pow_abs(ax1, P[ix[0]], fs / 1e3, fc)
+                add_text(ax1, 1.04, -0.04, '(ms)')
+                add_text(ax1, 0.98, 0.94, text, color=fc)
+                ax2 = fig.add_axes(rect2, facecolor=bc)
+                f = fs * Tcode / sdr_code.code_len(sig)
+                if opt[0] == 1: #1:'-p' 2:'-l'
+                    coff = (np.arange(len(coffs)) - ix[1]) / f
+                    plot_corr_peak_abs(ax2, coff, P[ix[0]], [-4.5, 4.5], fc)
+                    ax2.vlines(0.0, 0.0, 1.0, color=fc, lw=0.4)
+                    add_text(ax2, 0.98, 0.94, 'Code Offset')
+                    add_text(ax2, 1.04, -0.04, '(chip)')
+                else:
+                    plot_corr_peak_abs(ax2, dops, P.T[ix[1]], [dops[0], dops[-1]], fc)
+                    ax2.vlines(dop, 0.0, 1.0, color=fc, lw=0.4)
+                    add_text(ax2, 0.98, 0.94, 'Doppler Frequency')
+                    add_text(ax2, 1.04, -0.04, '(Hz)')
+                
+                if wm == True:
+                    P_kasami, Z = check_kasami(sig, prns[0], data, fs, fi, max_dop=max_dop, zero_pad=opt[2], ix=ix)
+                    text_kas = 'Kasami COFF=%.5fms, DOP=%.0fHz, Z=%.1f' % \
+                   (coffs[ix[1]] * 1e3, dop, Z)
+                    
+                    axA = fig.add_axes(rectA, facecolor=bc)
+                    plot_corr_pow_abs(axA, P_kasami[ix[0]], fs / 1e3, fc)
+                    add_text(axA, 1.04, -0.04, '(ms)')
+                    add_text(axA, 0.98, 0.94, text_kas, color=fc)
+                    axB = fig.add_axes(rectB, facecolor=bc)
+
+                    if opt[0] == 1: #1:'-p' 2:'-l'
+                        coff = (np.arange(len(coffs)) - ix[1]) / f
+                        plot_corr_peak_abs(axB, coff, P_kasami[ix[0]], [-4.5, 4.5], fc)
+                        axB.vlines(0.0, 0.0, 1.0, color=fc, lw=0.4)
+                        add_text(axB, 0.98, 0.94, 'Code Offset')
+                        add_text(axB, 1.04, -0.04, '(chip)')
+                    else:
+                        plot_corr_peak_abs(axB, dops, P_kasami.T[ix[1]], [dops[0], dops[-1]], fc)
+                        axB.vlines(dop, 0.0, 1.0, color=fc, lw=0.4)
+                        add_text(axB, 0.98, 0.94, 'Doppler Frequency')
+                        add_text(axB, 1.04, -0.04, '(Hz)')
+
+                    print("Kasami Power:", P_kasami[ix[0]][ix[1]])
+
+            else: # plot power
+                ax1 = fig.add_axes(rect0, facecolor=bc)
+                plot_corr_pow_abs(ax1, P[ix[0]], fs / 1e3, fc)
+                ax1.set_xlabel('Code Offset (ms)')
+                add_text(ax1, 0.98, 0.97, text)
+            
+            if not bg:
+                ax0.set_title('SIG = %s, %s = %d, MaxPow = %f WM = %s Tint = %f FILE = %s' % \
+                    (sig, label, prns[0], Pmax, wm, T, file), fontsize=10)
+            else: 
+                ax0.set_title('SIG = %s, %s = %d, Background, FILE = %s' % \
+                    (sig, label, prns[0], file), fontsize=10)
+    
+        if not opt[4]: # short output mode '-s'
+            print('TIME = %.3f s' % (time.time() - t))
+        plt.show()
+    
+        print(Pmax)
+    except KeyboardInterrupt:
+        exit()
+

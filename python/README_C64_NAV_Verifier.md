@@ -36,6 +36,12 @@ buttons for the IQ, PRN, expected NAV, and output paths. All receiver parameters
 can be changed before pressing **Run verification**. Processing runs separately
 so the window remains responsive, and the result or error is shown in its log.
 
+Select an **Output directory** and enter an **Output filename prefix**. All
+generated files are placed in that directory. The selected directory is saved
+when chosen or when verification starts, then restored on the next GUI launch.
+The preference is stored in `~/.config/c64-nav-verifier/gui.json` (or beneath
+`XDG_CONFIG_HOME` when that environment variable is set).
+
 The visual bit checker uses these colors:
 
 - Green: matched bit
@@ -111,6 +117,18 @@ The default search is -10 kHz to +10 kHz in 250 Hz steps:
 ```bash
 --doppler-min -10000 --doppler-max 10000 --doppler-step 250
 ```
+
+To bypass the Doppler sweep and use a known value, enter **Fixed Doppler** in
+the GUI or use:
+
+```bash
+--doppler-hz 3250
+```
+
+When fixed Doppler is provided, the minimum, maximum, and step settings are
+ignored. Residual carrier estimation remains enabled to correct a small error
+in the supplied value. The JSON report identifies the selected mode as
+`"fixed"` or `"search"`.
 
 The report contains the coarse acquired Doppler, residual estimate, and their
 sum. If the signal is weak, first narrow the range if the approximate Doppler

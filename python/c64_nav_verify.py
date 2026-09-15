@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -378,17 +379,34 @@ def launch_gui() -> None:
     root.columnconfigure(0, weight=1)
     root.rowconfigure(2, weight=1)
 
+    config_root = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+    gui_config_path = config_root / "c64-nav-verifier" / "gui.json"
+    try:
+        gui_config = json.loads(gui_config_path.read_text())
+    except (OSError, ValueError, TypeError):
+        gui_config = {}
+
+    def save_output_directory(directory: str) -> None:
+        try:
+            gui_config_path.parent.mkdir(parents=True, exist_ok=True)
+            gui_config_path.write_text(json.dumps({"output_directory": directory}, indent=2) + "\n")
+        except OSError:
+            pass  # Output processing can continue even if GUI preferences cannot be saved.
+
     files = ttk.LabelFrame(root, text="Files", padding=10)
     files.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 5))
     files.columnconfigure(1, weight=1)
     variables: dict[str, tk.StringVar] = {}
 
-    def file_row(row: int, key: str, label: str, pattern, save: bool = False) -> None:
+    def file_row(row: int, key: str, label: str, pattern, save: bool = False,
+                 directory: bool = False) -> None:
         var = variables[key] = tk.StringVar()
         ttk.Label(files, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
         ttk.Entry(files, textvariable=var).grid(row=row, column=1, sticky="ew", pady=3)
         def browse() -> None:
-            if save:
+            if directory:
+                chosen = filedialog.askdirectory(title=label, initialdir=var.get() or None)
+            elif save:
                 chosen = filedialog.asksaveasfilename(title=label, filetypes=pattern)
                 if chosen:
                     for suffix in (".json", ".txt", ".bin"):
@@ -399,13 +417,19 @@ def launch_gui() -> None:
                 chosen = filedialog.askopenfilename(title=label, filetypes=pattern)
             if chosen:
                 var.set(chosen)
+                if directory:
+                    save_output_directory(chosen)
         ttk.Button(files, text="Browse…", command=browse).grid(row=row, column=2, padx=(8, 0), pady=3)
 
     file_row(0, "iq", "C64 IQ recording", [("Complex64 IQ", "*.c64 *.binC64"), ("All files", "*")])
     file_row(1, "prn", "PRN code file", [("PRN files", "*.txt *.bin"), ("All files", "*")])
     file_row(2, "nav", "Expected NAV (optional)", [("NAV files", "*.bin *.txt"), ("All files", "*")])
-    file_row(3, "output", "Output prefix", [("Output prefix", "*"), ("All files", "*")], save=True)
-    variables["output"].set("nav_recovery")
+    file_row(3, "output_dir", "Output directory", [("All files", "*")], directory=True)
+    variables["output_dir"].set(gui_config.get("output_directory", str(Path.cwd())))
+    variables["output_name"] = tk.StringVar(value="nav_recovery")
+    ttk.Label(files, text="Output filename prefix").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=3)
+    ttk.Entry(files, textvariable=variables["output_name"]).grid(row=4, column=1,
+                                                                 columnspan=2, sticky="ew", pady=3)
 
     params = ttk.LabelFrame(root, text="Parameters", padding=10)
     params.grid(row=1, column=0, sticky="ew", padx=10, pady=5)
@@ -417,6 +441,7 @@ def launch_gui() -> None:
         ("chip_rate", "Chip rate (chip/s)", "1023000"), ("code_ms", "Code period (ms)", "1"),
         ("nav_rate", "NAV rate (bit/s)", "50"), ("doppler_min", "Doppler minimum (Hz)", "-10000"),
         ("doppler_max", "Doppler maximum (Hz)", "10000"), ("doppler_step", "Doppler step (Hz)", "250"),
+        ("doppler_hz", "Fixed Doppler (Hz, blank = search)", ""),
         ("track_search", "Local search (samples)", "8"), ("track_batch_ms", "Full relock interval (ms)", "100"),
         ("max_bit_slip", "Maximum bit slip", "200"), ("skip_seconds", "Start offset (s)", "0"),
         ("flip_run", "Possible flip run (bits)", "8"),
@@ -424,6 +449,7 @@ def launch_gui() -> None:
         ("preamble", "Custom preamble", "10100111"),
         ("display_bits_per_row", "Bits per visual row", "30"),
     ]
+    parameter_entries = {}
     for i, (key, label, value) in enumerate(defaults):
         row, side = divmod(i, 2)
         base = side * 2
@@ -433,8 +459,15 @@ def launch_gui() -> None:
             ttk.Combobox(params, textvariable=var, values=("auto", "yes", "no"),
                          state="readonly", width=14).grid(row=row, column=base + 1, sticky="ew", padx=(0, 14), pady=3)
         else:
-            ttk.Entry(params, textvariable=var, width=18).grid(row=row, column=base + 1,
-                                                               sticky="ew", padx=(0, 14), pady=3)
+            entry = ttk.Entry(params, textvariable=var, width=18)
+            entry.grid(row=row, column=base + 1, sticky="ew", padx=(0, 14), pady=3)
+            parameter_entries[key] = entry
+    def update_doppler_controls(*_args) -> None:
+        state = "disabled" if variables["doppler_hz"].get().strip() else "normal"
+        for key in ("doppler_min", "doppler_max", "doppler_step"):
+            parameter_entries[key].configure(state=state)
+    variables["doppler_hz"].trace_add("write", update_doppler_controls)
+    update_doppler_controls()
     align_columns = tk.BooleanVar(value=False)
     ttk.Checkbutton(params, text="Align columns to detected subframe/word boundary",
                     variable=align_columns).grid(row=(len(defaults) + 1) // 2,
@@ -492,7 +525,8 @@ def launch_gui() -> None:
         "prn_row": "--prn-row", "fs": "--fs", "if_hz": "--if-hz",
         "chip_rate": "--chip-rate", "code_ms": "--code-ms", "nav_rate": "--nav-rate",
         "doppler_min": "--doppler-min", "doppler_max": "--doppler-max",
-        "doppler_step": "--doppler-step", "track_search": "--track-search",
+        "doppler_step": "--doppler-step", "doppler_hz": "--doppler-hz",
+        "track_search": "--track-search",
         "track_batch_ms": "--track-batch-ms", "max_bit_slip": "--max-bit-slip",
         "skip_seconds": "--skip-seconds", "flip_run": "--flip-run", "duration": "--duration",
     }
@@ -597,7 +631,13 @@ def launch_gui() -> None:
         if not variables["iq"].get() or not variables["prn"].get():
             messagebox.showerror("Missing input", "Select both the C64 recording and PRN file.")
             return
-        output_prefix = variables["output"].get()
+        output_directory = variables["output_dir"].get().strip()
+        output_name = variables["output_name"].get().strip()
+        if not output_directory or not output_name:
+            messagebox.showerror("Missing output", "Select an output directory and enter a filename prefix.")
+            return
+        output_prefix = str(Path(output_directory).expanduser() / output_name)
+        save_output_directory(output_directory)
         flip_run_value = int(variables["flip_run"].get())
         preamble_value = variables["preamble"].get()
         align_columns_value = bool(align_columns.get())
@@ -667,6 +707,8 @@ def main() -> None:
     ap.add_argument("--doppler-min", type=float, default=-10000.0)
     ap.add_argument("--doppler-max", type=float, default=10000.0)
     ap.add_argument("--doppler-step", type=float, default=250.0)
+    ap.add_argument("--doppler-hz", type=float,
+                    help="fixed Doppler shift; disables the Doppler sweep")
     ap.add_argument("--track-search", type=int, default=8,
                     help="code tracking radius in samples (default: 8)")
     ap.add_argument("--track-batch-ms", type=float, default=100.0,
@@ -692,8 +734,17 @@ def main() -> None:
     count = -1 if args.duration is None else int(round(args.duration * args.fs))
     x = np.memmap(args.iq, dtype=np.complex64, mode="r", offset=start * 8,
                   shape=None if count < 0 else (count,))
+    if args.doppler_hz is None:
+        doppler_min, doppler_max, doppler_step = (args.doppler_min,
+                                                  args.doppler_max,
+                                                  args.doppler_step)
+        doppler_mode = "search"
+    else:
+        doppler_min = doppler_max = args.doppler_hz
+        doppler_step = 1.0
+        doppler_mode = "fixed"
     acq = acquire(x, prn, args.fs, args.chip_rate, args.code_ms, args.if_hz,
-                  args.doppler_min, args.doppler_max, args.doppler_step)
+                  doppler_min, doppler_max, doppler_step)
     prompt, code_offsets = track_ms(x, prn, args.fs, args.chip_rate, args.code_ms,
                                     args.if_hz, acq["doppler_hz"],
                                     acq["code_phase_samples"], args.track_search,
@@ -737,6 +788,8 @@ def main() -> None:
         "input": str(args.iq), "prn": str(args.prn), "prn_row": args.prn_row,
         "prn_length_chips": int(len(prn)), "sample_rate_hz": args.fs,
         "if_hz": args.if_hz, "acquired_doppler_hz": acq["doppler_hz"],
+        "doppler_mode": doppler_mode,
+        "configured_fixed_doppler_hz": args.doppler_hz,
         "residual_doppler_hz": residual,
         "estimated_total_doppler_hz": acq["doppler_hz"] + residual,
         "initial_code_phase_samples": acq["code_phase_samples"],

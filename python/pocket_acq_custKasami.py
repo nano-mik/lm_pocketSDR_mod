@@ -15,7 +15,7 @@
 #  2022-02-17  1.4  add option: -h
 #  2024-12-19  1.5  add option: -IQ
 #
-import sys, time
+import sys, time, csv
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -35,7 +35,7 @@ ESC_RES = '\033[0m'  # ANSI escape reset
 def show_usage():
     print('Usage: pocket_acq.py [-sig sig] [-prn prn[,...]] [-tint tint]')
     print('       [-toff toff] [-f freq] [-fi freq] [-IQ] [-d freq] [-nz] [-np]')
-    print('       [-s] [-p] [-l] [-3d] file')
+    print('       [-s] [-p] [-l] [-3d] [-csv output.csv] file')
 
 # show signal type IDs ---------------------------------------------------------
 def show_sigid():
@@ -200,6 +200,38 @@ def check_kasami(sig, prn, data, fs, fi, max_dop, zero_pad, ix):
     print("P Kasami:", P_kasami[ix[0]][ix[1]])
     # return P / P_max, fds, coffs, ix, cn0, dop, P_max
     return P_kasami, Z
+
+# export one acquisition job (batch runner consolidates jobs per recording) --------
+def export_csv(path, rows, file, fs, fi, toff, T, sig):
+    with open(path, 'w', newline='') as out:
+        out.write('# schema_version: 1\n# recording_file: %s\n' % file)
+        out.write('# sampling_hz: %s\n# if_hz: %s\n' % (fs, fi))
+        out.write('# time_offset_origin: recording_start\n# score: dimensionless_z_score\n')
+        writer = csv.writer(out)
+        writer.writerow(['[SUMMARY]'])
+        writer.writerow(['job_id', 'code_type', 'code_id', 'time_offset_ms',
+                         'integration_time_ms', 'correlation_power', 'z_score',
+                         'background_mean', 'background_std', 'code_offset_ms',
+                         'doppler_hz', 'doppler_bin_hz'])
+        for kind, prn, P, fds, coffs, ix, z, dop in rows:
+            mu, sigma = noise_stats(P, 2, 32)
+            writer.writerow([1, kind, prn, toff * 1e3, T * 1e3,
+                             float(P[ix]), float(z), float(mu), float(sigma),
+                             float(coffs[ix[1]] * 1e3), float(dop), float(fds[ix[0]])])
+        writer.writerow([])
+        writer.writerow(['[CODE_OFFSET_CORRELATIONS]'])
+        writer.writerow(['job_id', 'code_type', 'code_id', 'doppler_ref_hz',
+                         'code_offset_ms', 'correlation_power'])
+        for kind, prn, P, fds, coffs, ix, z, dop in rows:
+            writer.writerows((1, kind, prn, float(fds[ix[0]]), float(coffs[j] * 1e3), float(v))
+                             for j, v in enumerate(P[ix[0]]))
+        writer.writerow([])
+        writer.writerow(['[DOPPLER_CORRELATIONS]'])
+        writer.writerow(['job_id', 'code_type', 'code_id', 'code_offset_ref_ms',
+                         'doppler_hz', 'correlation_power'])
+        for kind, prn, P, fds, coffs, ix, z, dop in rows:
+            writer.writerows((1, kind, prn, float(coffs[ix[1]] * 1e3), float(fd),
+                              float(P[j, ix[1]])) for j, fd in enumerate(fds))
 
 # plot C/N0 --------------------------------------------------------------------
 def plot_cn0(ax, cn0, prns, fc):
@@ -409,6 +441,7 @@ if __name__ == '__main__':
     sdrn = 'pocketsdr'
     ms = 1
     Pmax = 0
+    csv_path = None
     
     i = 1
     while i < len(sys.argv):
@@ -421,7 +454,7 @@ if __name__ == '__main__':
         elif sys.argv[i] == '-tint':
             i += 1
             T = float(sys.argv[i]) * 1e-3
-        elif sys.argv[i] == '-  ':
+        elif sys.argv[i] == '-toff':
             i += 1
             toff = float(sys.argv[i]) * 1e-3
         elif sys.argv[i] == '-f':
@@ -452,6 +485,9 @@ if __name__ == '__main__':
             bg = True
         elif sys.argv[i] == '-wm':
             wm = True
+        elif sys.argv[i] == '-csv':
+            i += 1
+            csv_path = sys.argv[i]
         #elif sys.argv[i] == '-ms':
             #i += 1
             #ms = int(sys.argv[i])
@@ -502,14 +538,15 @@ if __name__ == '__main__':
             ax0.axis('off')
         t = time.time()
         
-        ms = T
+        rows = []
         
         if len(prns) > 1:
             cn0 = np.zeros(len(prns))
             for i in range(len(prns)):
                 P, dops, coffs, ix, cn0[i], dop, Pmax = search_sig(sig, prns[i], data,
-                    fs, fi, max_dop=max_dop, zero_pad=opt[2], ms=ms) # opt[2] '-nz'
+                    fs, fi, max_dop=max_dop, zero_pad=opt[2]) # opt[2] '-nz'
                 
+                rows.append(('PRN', prns[i], P, dops, coffs, ix, cn0[i], dop))
                 if opt[4]: # short output mode '-s'
                     print('%d %.0f' % (prns[i], cn0[i]))
                 else:
@@ -528,6 +565,11 @@ if __name__ == '__main__':
         else:
             P, dops, coffs, ix, cn0, dop, Pmax = search_sig(sig, prns[0], data, fs, fi,
                 max_dop=max_dop, zero_pad=opt[2]) # opt[2] '-nz'
+            rows.append(('PRN', prns[0], P, dops, coffs, ix, cn0, dop))
+            if wm:
+                P_kasami, Z = check_kasami(sig, prns[0], data, fs, fi,
+                    max_dop=max_dop, zero_pad=opt[2], ix=ix)
+                rows.append(('KASAMI', prns[0], P_kasami, dops, coffs, ix, Z, dop))
             text = 'COFF=%.5fms, DOP=%.0fHz, Z=%.1fdB-Hz' % \
                    (coffs[ix[1]] * 1e3, dop, cn0)
 
@@ -539,6 +581,8 @@ if __name__ == '__main__':
                         (ESC_COL if cn0 >= THRES_CN0 else '',
                          sig, label, prns[0], coffs[ix[1]] * 1e3, dop, cn0,
                          ESC_RES if cn0 >= THRES_CN0 else ''))
+                if csv_path:
+                    export_csv(csv_path, rows, file, fs, fi, toff, T, sig)
                 exit()
             elif opt[1]: # plot 3D '-3d'
                 ax1 = fig.add_axes(rect3, projection='3d', facecolor='None')
@@ -565,7 +609,6 @@ if __name__ == '__main__':
                     add_text(ax2, 1.04, -0.04, '(Hz)')
                 
                 if wm == True:
-                    P_kasami, Z = check_kasami(sig, prns[0], data, fs, fi, max_dop=max_dop, zero_pad=opt[2], ix=ix)
                     text_kas = 'Kasami COFF=%.5fms, DOP=%.0fHz, Z=%.1f' % \
                    (coffs[ix[1]] * 1e3, dop, Z)
                     
@@ -602,6 +645,8 @@ if __name__ == '__main__':
                 ax0.set_title('SIG = %s, %s = %d, Background, FILE = %s' % \
                     (sig, label, prns[0], file), fontsize=10)
     
+        if csv_path:
+            export_csv(csv_path, rows, file, fs, fi, toff, T, sig)
         if not opt[4]: # short output mode '-s'
             print('TIME = %.3f s' % (time.time() - t))
         plt.show()
